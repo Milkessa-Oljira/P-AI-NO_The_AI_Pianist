@@ -5,7 +5,6 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import os
 from music21 import midi
-import numpy as np
 import argparse
 from tqdm import tqdm
 
@@ -84,15 +83,15 @@ def train_critic(dataset_root, save_path, epochs=10, batch_size=32, lr=1e-4, dev
     All performances in the dataset are high quality, so they are labeled as 1.
     """
     dataset = MAESTRODataset(dataset_root)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=0)
     model = CriticModel().to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.BCELoss()
     model.train()
 
-    for epoch in tqdm(range(epochs)):
+    for epoch in range(epochs):
         total_loss = 0.0
-        for batch in dataloader:
+        for batch in tqdm(dataloader, total=len(dataloader), desc=f"Epoch {epoch+1}/{epochs}"):
             if batch.numel() == 0:
                 continue
             batch = batch.to(device)
@@ -137,7 +136,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_root', type=str, nargs='?', default='datasets/', help='Path to the MAESTRO dataset folder')
     parser.add_argument('--save_path', type=str, default='model_chkpts/critic_model.pth', help='Path to save the trained critic model')
     parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--device', type=str, default='cpu', help='Device to use: cpu or cuda')
     args = parser.parse_args()
