@@ -2,3 +2,5 @@ gymnasium
 pygame
 torch
 numpy
+music21
+tqdm
