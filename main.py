@@ -10,10 +10,20 @@ from models.critic_model import evaluate_piano_performance
 class PianoEnv(gym.Env):
     metadata = {'render.modes': ['human']}
     
+    # Base offsets for natural finger spread
+    base_offsets_left = {'pinky': -2, 'ring': -1, 'middle': 0, 'index': 1, 'thumb': 2}
+    base_offsets_right = {'thumb': -2, 'index': -1, 'middle': 0, 'ring': 1, 'pinky': 2}
+    
     def __init__(self, render_mode=False, critic_model_path="critic_model.pth"):
         super(PianoEnv, self).__init__()
         self.render_mode = render_mode
         self.critic_model_path = critic_model_path
+        
+        # Timing parameters
+        self.time_per_step = 0.1  # Seconds per step (10 FPS base)
+        self.current_step = 0.0   # Track steps as float
+        self.active_notes = []    # List of (key, release_step) tuples
+        self.epsilon = 1e-5       # Tolerance for floating-point precision
         
         # Observation space
         self.observation_space = spaces.Dict({
@@ -49,13 +59,15 @@ class PianoEnv(gym.Env):
         
         # Initial state
         self.state = {
-            "left_hand": np.array([20, 22, 24, 26, 28], dtype=np.int32),
-            "right_hand": np.array([60, 62, 64, 66, 68], dtype=np.int32),
+            "left_center": 24,
+            "right_center": 60,
+            "left_hand": np.array([24 + self.base_offsets_left[f] for f in ['pinky', 'ring', 'middle', 'index', 'thumb']], dtype=np.int32),
+            "right_hand": np.array([60 + self.base_offsets_right[f] for f in ['thumb', 'index', 'middle', 'ring', 'pinky']], dtype=np.int32),
             "prev_finger": np.zeros(10, dtype=np.int32)
         }
         self.performance_sequence = []
         
-        # Pygame initialization for rendering
+        # Pygame initialization
         if self.render_mode:
             pygame.init()
             self.screen = pygame.display.set_mode((1200, 400))
@@ -63,7 +75,7 @@ class PianoEnv(gym.Env):
             self.clock = pygame.time.Clock()
             self.relative_pos = {0: 0, 1: 0.5, 2: 1, 3: 1.5, 4: 2, 5: 3, 6: 3.5, 7: 4, 8: 4.5, 9: 5, 10: 5.5, 11: 6}
             self.key_rects = self._init_key_rects()
-    
+
     def _init_key_rects(self):
         key_rects = []
         total_units = 7 * 7 + self.relative_pos[87 % 12]  # 88 keys span 50.5 units
@@ -72,7 +84,7 @@ class PianoEnv(gym.Env):
         black_key_width = 14
         white_key_height = 120
         black_key_height = 90
-        base_y = 280  # Adjusted to fit hands below
+        base_y = 280
         
         for n in range(88):
             note = n % 12
@@ -88,41 +100,71 @@ class PianoEnv(gym.Env):
             color = (240, 240, 240) if is_white else (20, 20, 20)
             key_rects.append((rect, color, is_white))
         return key_rects
-    
+
     def step(self, action):
+        self.current_step += 1.0
         reward = 0
         done = False
         info = {}
         
-        left_hor_move = action["left_hand_horizontal_movement"] - 87
-        right_hor_move = action["right_hand_horizontal_movement"] - 87
-        self.state["left_hand"] = np.clip(self.state["left_hand"] + left_hor_move, 0, 87)
-        self.state["right_hand"] = np.clip(self.state["right_hand"] + right_hor_move, 0, 87)
+        # Left hand stretch
+        left_pinky_stretch = action["left_hand_finger_stretch"]["pinky"].item()
+        left_thumb_stretch = action["left_hand_finger_stretch"]["thumb"].item()
+        left_pinky_offset = -3 if left_pinky_stretch == 0 else -2
+        left_thumb_offset = 2 + left_thumb_stretch
+        min_center_left = -left_pinky_offset
+        max_center_left = 87 - left_thumb_offset
         
-        left_center = int(np.median(self.state["left_hand"]))
-        left_offsets = action["left_hand_finger_stretch"]
+        # Right hand stretch
+        right_thumb_stretch = action["right_hand_finger_stretch"]["thumb"].item()
+        right_pinky_stretch = action["right_hand_finger_stretch"]["pinky"].item()
+        right_thumb_offset = -2 - right_thumb_stretch
+        right_pinky_offset = 2 + (1 if right_pinky_stretch == 1 else 0)
+        min_center_right = -right_thumb_offset
+        max_center_right = 87 - right_pinky_offset
+        
+        # Update hand centers
+        left_hor_move = action["left_hand_horizontal_movement"] - 87
+        new_left_center = self.state["left_center"] + left_hor_move
+        self.state["left_center"] = np.clip(new_left_center, min_center_left, max_center_left)
+        
+        right_hor_move = action["right_hand_horizontal_movement"] - 87
+        new_right_center = self.state["right_center"] + right_hor_move
+        self.state["right_center"] = np.clip(new_right_center, min_center_right, max_center_right)
+        
+        # Calculate finger positions
         left_fingers = np.array([
-            left_center + (-1 if left_offsets["pinky"].item() == 0 else 0),
-            left_center,
-            left_center,
-            left_center,
-            left_center + left_offsets["thumb"].item()
+            self.state["left_center"] + left_pinky_offset,
+            self.state["left_center"] + self.base_offsets_left['ring'],
+            self.state["left_center"] + self.base_offsets_left['middle'],
+            self.state["left_center"] + self.base_offsets_left['index'],
+            self.state["left_center"] + left_thumb_offset
         ], dtype=np.int32)
         self.state["left_hand"] = np.clip(left_fingers, 0, 87)
         
-        right_center = int(np.median(self.state["right_hand"]))
-        right_offsets = action["right_hand_finger_stretch"]
         right_fingers = np.array([
-            right_center + right_offsets["thumb"].item(),
-            right_center,
-            right_center,
-            right_center,
-            right_center + (0 if right_offsets["pinky"].item() == 0 else 1)
+            self.state["right_center"] + right_thumb_offset,
+            self.state["right_center"] + self.base_offsets_right['index'],
+            self.state["right_center"] + self.base_offsets_right['middle'],
+            self.state["right_center"] + self.base_offsets_right['ring'],
+            self.state["right_center"] + right_pinky_offset
         ], dtype=np.int32)
         self.state["right_hand"] = np.clip(right_fingers, 0, 87)
         
-        self.state["prev_finger"] = np.array(action["finger_press"], dtype=np.int32)
+        # Update active notes
+        self.active_notes = [(key, release) for key, release in self.active_notes if release > self.current_step + self.epsilon]
+        fingers = action["finger_press"]
+        durations = action["finger_duration"]
+        for i in range(10):
+            if fingers[i] == 1:
+                key = self.state["left_hand"][i] if i < 5 else self.state["right_hand"][i - 5]
+                duration_steps = durations[i] / self.time_per_step
+                release_step = self.current_step + duration_steps
+                self.active_notes.append((key, release_step))
         
+        self.state["prev_finger"] = np.array(fingers, dtype=np.int32)
+        
+        # Record performance
         note = {
             "left": self.state["left_hand"].tolist(),
             "right": self.state["right_hand"].tolist(),
@@ -130,21 +172,17 @@ class PianoEnv(gym.Env):
         }
         self.performance_sequence.append(note)
         
+        # Reward logic
         if np.any(self.state["left_hand"] <= 0) or np.any(self.state["left_hand"] >= 87):
             reward -= 1
         if np.any(self.state["right_hand"] <= 0) or np.any(self.state["right_hand"] >= 87):
             reward -= 1
-        
-        left_center = int(np.median(self.state["left_hand"]))
-        right_center = int(np.median(self.state["right_hand"]))
-        if abs(left_center - right_center) < 13:
+        if abs(self.state["left_center"] - self.state["right_center"]) < 13:
             reward -= 1
-        
         if action["finished_playing"] == 1:
             done = True
             midi_sequence = self.generate_midi_sequence()
-            critic_score = 0
-            # critic_score = evaluate_piano_performance(midi_sequence, self.critic_model_path)
+            critic_score = evaluate_piano_performance(midi_sequence, self.critic_model_path)
             steps = len(self.performance_sequence)
             step_scale = max(0.0, 1.0 - abs(steps - 300) / 300.0) if abs(steps - 300) >= 1 else 1.0
             reward += critic_score * step_scale
@@ -152,9 +190,13 @@ class PianoEnv(gym.Env):
         return self.state, reward, done, info
     
     def reset(self):
+        self.current_step = 0.0
+        self.active_notes = []
         self.state = {
-            "left_hand": np.array([20, 22, 24, 26, 28], dtype=np.int32),
-            "right_hand": np.array([60, 62, 64, 66, 68], dtype=np.int32),
+            "left_center": 24,
+            "right_center": 60,
+            "left_hand": np.array([24 + self.base_offsets_left[f] for f in ['pinky', 'ring', 'middle', 'index', 'thumb']], dtype=np.int32),
+            "right_hand": np.array([60 + self.base_offsets_right[f] for f in ['thumb', 'index', 'middle', 'ring', 'pinky']], dtype=np.int32),
             "prev_finger": np.zeros(10, dtype=np.int32)
         }
         self.performance_sequence = []
@@ -164,25 +206,18 @@ class PianoEnv(gym.Env):
         if not self.render_mode:
             return
         
-        self.screen.fill((200, 200, 200))  # Light gray background
+        self.screen.fill((200, 200, 200))
         
         # Determine pressed keys
-        pressed_keys = set()
-        for i in range(5):
-            if self.state["prev_finger"][i] == 1:
-                pressed_keys.add(self.state["left_hand"][i])
-        for i in range(5):
-            if self.state["prev_finger"][i + 5] == 1:
-                pressed_keys.add(self.state["right_hand"][i])
+        pressed_keys = set(key for key, release_step in self.active_notes if release_step > self.current_step + self.epsilon)
         
-        # Draw piano keys with 3D effect
+        # Draw piano keys
         for n, (rect, base_color, is_white) in enumerate(self.key_rects):
             if n in pressed_keys:
                 color = (180, 180, 180) if is_white else (60, 60, 60)
                 rect.y += 5
             else:
                 color = base_color
-            
             pygame.draw.rect(self.screen, color, rect)
             if is_white:
                 pygame.draw.line(self.screen, (150, 150, 150), (rect.left, rect.top), (rect.left, rect.bottom), 2)
@@ -193,63 +228,45 @@ class PianoEnv(gym.Env):
             if n in pressed_keys:
                 rect.y -= 5
         
-        # Draw hands below keys
-        finger_radius = 10
-        hand_y_base = 300  # Positioned below keys (base_y=280)
+        # Hand rendering
+        palm_y = 300
+        finger_length = 20
+        pressing_y = 280
         
-        # Left hand (pinky to thumb)
-        left_positions = []
-        for i in range(5):
-            key = self.state["left_hand"][i]
-            if 0 <= key < 88:  # Index safety
-                rect = self.key_rects[key][0]
-                x = rect.centerx
-                y_offset = i * 5
-                y = hand_y_base + y_offset
-                is_pressing = self.state["prev_finger"][i] == 1
-                color = (255, 100, 100) if is_pressing else (200, 80, 80)
-                if is_pressing:
-                    y -= 10  # Move up when pressing
-                pygame.draw.circle(self.screen, color, (int(x), int(y)), finger_radius)
-                left_positions.append((int(x), int(y)))
+        # Left hand
+        left_finger_xs = [self.key_rects[key][0].centerx for key in self.state["left_hand"]]
+        for i, x in enumerate(left_finger_xs):
+            is_pressing = self.state["left_hand"][i] in pressed_keys
+            y_end = pressing_y if is_pressing else palm_y - finger_length
+            color = (255, 100, 100) if is_pressing else (200, 80, 80)
+            width = 7 if is_pressing else 5
+            pygame.draw.line(self.screen, color, (x, palm_y), (x, y_end), width)
         
-        # Right hand (thumb to pinky)
-        right_positions = []
-        for i in range(5):
-            key = self.state["right_hand"][i]
-            if 0 <= key < 88:  # Index safety
-                rect = self.key_rects[key][0]
-                x = rect.centerx
-                y_offset = (4 - i) * 5
-                y = hand_y_base + y_offset
-                is_pressing = self.state["prev_finger"][i + 5] == 1
-                color = (100, 100, 255) if is_pressing else (80, 80, 200)
-                if is_pressing:
-                    y -= 10
-                pygame.draw.circle(self.screen, color, (int(x), int(y)), finger_radius)
-                right_positions.append((int(x), int(y)))
+        # Left palm
+        if left_finger_xs:
+            palm_left = min(left_finger_xs) - 10
+            palm_right = max(left_finger_xs) + 10
+            palm_height = 20
+            pygame.draw.rect(self.screen, (180, 80, 80), (palm_left, palm_y - palm_height / 2, palm_right - palm_left, palm_height))
         
-        # Draw palms
-        if left_positions:
-            palm_color = (180, 80, 80)
-            palm_y = hand_y_base + 20
-            palm_left = min(x for x, _ in left_positions)
-            palm_right = max(x for x, _ in left_positions)
-            palm_rect = pygame.Rect(palm_left, palm_y, palm_right - palm_left, 20)
-            pygame.draw.rect(self.screen, palm_color, palm_rect, border_radius=5)
-            pygame.draw.rect(self.screen, (150, 50, 50), palm_rect, 1)
+        # Right hand
+        right_finger_xs = [self.key_rects[key][0].centerx for key in self.state["right_hand"]]
+        for i, x in enumerate(right_finger_xs):
+            is_pressing = self.state["right_hand"][i] in pressed_keys
+            y_end = pressing_y if is_pressing else palm_y - finger_length
+            color = (100, 100, 255) if is_pressing else (80, 80, 200)
+            width = 7 if is_pressing else 5
+            pygame.draw.line(self.screen, color, (x, palm_y), (x, y_end), width)
         
-        if right_positions:
-            palm_color = (80, 80, 180)
-            palm_y = hand_y_base + 20
-            palm_left = min(x for x, _ in right_positions)
-            palm_right = max(x for x, _ in right_positions)
-            palm_rect = pygame.Rect(palm_left, palm_y, palm_right - palm_left, 20)
-            pygame.draw.rect(self.screen, palm_color, palm_rect, border_radius=5)
-            pygame.draw.rect(self.screen, (50, 50, 150), palm_rect, 1)
+        # Right palm
+        if right_finger_xs:
+            palm_left = min(right_finger_xs) - 10
+            palm_right = max(right_finger_xs) + 10
+            palm_height = 20
+            pygame.draw.rect(self.screen, (80, 80, 180), (palm_left, palm_y - palm_height / 2, palm_right - palm_left, palm_height))
         
         pygame.display.flip()
-        self.clock.tick(4)
+        self.clock.tick(1 / self.time_per_step)
     
     def generate_midi_sequence(self):
         midi_sequence = []
@@ -289,7 +306,7 @@ def train_agent(env, agent, num_episodes=1000):
                 for key, val in action.items():
                     rollouts['actions'][key].append(val)
             rollouts['observations'].append(obs_vector)
-            rollouts['log_probs'].append(log_prob.item())
+            rollouts['log_probs'].append(log_prob)
             
             obs, reward, done, info = env.step(action)
             episode_reward += reward
@@ -326,7 +343,7 @@ def main():
     parser.add_argument('--episodes', type=int, default=1000, help='Number of training episodes')
     parser.add_argument('--render', action='store_true', help='Render the environment using pygame')
     parser.add_argument('--visualize', type=int, default=1, help='Set to >0 to visualize one never-ending episode with random actions')
-    parser.add_argument('--critic_model_path', type=str, default='critic_model.pth', help='Path to the pre-trained critic model')
+    parser.add_argument('--critic_model_path', type=str, default='model_chkpts/critic_model.pth', help='Path to the pre-trained critic model')
     args = parser.parse_args()
     
     env = PianoEnv(render_mode=args.render, critic_model_path=args.critic_model_path)
@@ -348,6 +365,7 @@ def main():
                             break
                 
                 action = env.action_space.sample()
+                action["finger_duration"] = np.clip(action["finger_duration"], 0, 1.0)
                 obs, reward, done, info = env.step(action)
                 total_reward += reward
                 step_count += 1
@@ -368,7 +386,7 @@ def main():
         print("Starting training...")
         rewards = train_agent(env, agent, num_episodes=args.episodes)
         print("Training complete. Episode rewards:", rewards)
-        agent.save('ppo_agent.pth')
+        agent.save('model_chkpts/ppo_agent.pth')
     
     env.close()
 

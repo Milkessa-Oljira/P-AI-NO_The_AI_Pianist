@@ -1,0 +1,16 @@
+P-AI-NO_the_ai_pianist/
+    - datasets/
+    ... "1276 .midi formated files" ...
+    - model_chkpts/
+        - critic_model.pth
+        - ppo_agent.pth
+    - models/
+        - critic_model.py
+        - rl_agent.py
+    - venv/
+    - main.py
+    - requirements.txt
+    - LICENSE
+    - README.md
+    - .gitattributes
+    - .gitignore
