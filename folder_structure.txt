@@ -1,4 +1,4 @@
-P-AI-NO_the_ai_pianist/
+P-AI-NO_the_AI_Pianist/
     - datasets/
     ... "1276 .midi formated files" ...
     - model_chkpts/
