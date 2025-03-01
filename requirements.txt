@@ -4,3 +4,4 @@ torch
 numpy
 music21
 tqdm
+mido

@@ -10,7 +10,7 @@ from models.critic_model import evaluate_piano_performance
 class PianoEnv(gym.Env):
     metadata = {'render.modes': ['human']}
     
-    # Base offsets for natural finger spread
+    # Define base offsets for natural finger spread
     base_offsets_left = {'pinky': -2, 'ring': -1, 'middle': 0, 'index': 1, 'thumb': 2}
     base_offsets_right = {'thumb': -2, 'index': -1, 'middle': 0, 'ring': 1, 'pinky': 2}
     
@@ -19,11 +19,11 @@ class PianoEnv(gym.Env):
         self.render_mode = render_mode
         self.critic_model_path = critic_model_path
         
-        # Timing parameters
+        # Timing parameters for dynamic rendering
         self.time_per_step = 0.1  # Seconds per step (10 FPS base)
         self.current_step = 0.0   # Track steps as float
         self.active_notes = []    # List of (key, release_step) tuples
-        self.epsilon = 1e-5       # Tolerance for floating-point precision
+        self.epsilon = 1e-5       # Small tolerance for floating-point precision
         
         # Observation space
         self.observation_space = spaces.Dict({
@@ -57,7 +57,7 @@ class PianoEnv(gym.Env):
             "finished_playing": spaces.Discrete(2)
         })
         
-        # Initial state
+        # Initial state with centers
         self.state = {
             "left_center": 24,
             "right_center": 60,
@@ -75,12 +75,12 @@ class PianoEnv(gym.Env):
             self.clock = pygame.time.Clock()
             self.relative_pos = {0: 0, 1: 0.5, 2: 1, 3: 1.5, 4: 2, 5: 3, 6: 3.5, 7: 4, 8: 4.5, 9: 5, 10: 5.5, 11: 6}
             self.key_rects = self._init_key_rects()
-
+    
     def _init_key_rects(self):
         key_rects = []
-        total_units = 7 * 7 + self.relative_pos[87 % 12]  # 88 keys span 50.5 units
+        total_units = 7 * 7 + self.relative_pos[87 % 12]
         scale = 1200 / total_units
-        white_key_width = 24
+        white_key_width = 24.5  # Adjusted to ensure keys touch
         black_key_width = 14
         white_key_height = 120
         black_key_height = 90
@@ -100,30 +100,30 @@ class PianoEnv(gym.Env):
             color = (240, 240, 240) if is_white else (20, 20, 20)
             key_rects.append((rect, color, is_white))
         return key_rects
-
+    
     def step(self, action):
         self.current_step += 1.0
         reward = 0
         done = False
         info = {}
         
-        # Left hand stretch
-        left_pinky_stretch = action["left_hand_finger_stretch"]["pinky"].item()
-        left_thumb_stretch = action["left_hand_finger_stretch"]["thumb"].item()
+        # Extract stretch actions for left hand
+        left_pinky_stretch = action["left_hand_finger_stretch"]["pinky"].item()  # 0 or 1
+        left_thumb_stretch = action["left_hand_finger_stretch"]["thumb"].item()  # 0, 1, or 2
         left_pinky_offset = -3 if left_pinky_stretch == 0 else -2
         left_thumb_offset = 2 + left_thumb_stretch
-        min_center_left = -left_pinky_offset
-        max_center_left = 87 - left_thumb_offset
+        min_center_left = -left_pinky_offset  # e.g., 3 or 2
+        max_center_left = 87 - left_thumb_offset  # e.g., 85, 84, or 83
         
-        # Right hand stretch
-        right_thumb_stretch = action["right_hand_finger_stretch"]["thumb"].item()
-        right_pinky_stretch = action["right_hand_finger_stretch"]["pinky"].item()
-        right_thumb_offset = -2 - right_thumb_stretch
-        right_pinky_offset = 2 + (1 if right_pinky_stretch == 1 else 0)
-        min_center_right = -right_thumb_offset
-        max_center_right = 87 - right_pinky_offset
+        # Extract stretch actions for right hand
+        right_thumb_stretch = action["right_hand_finger_stretch"]["thumb"].item()  # 0, 1, or 2
+        right_pinky_stretch = action["right_hand_finger_stretch"]["pinky"].item()  # 0 or 1
+        right_thumb_offset = -2 - right_thumb_stretch  # -2, -3, or -4
+        right_pinky_offset = 2 + (1 if right_pinky_stretch == 1 else 0)  # 2 or 3
+        min_center_right = -right_thumb_offset  # e.g., 2, 3, or 4
+        max_center_right = 87 - right_pinky_offset  # e.g., 85 or 84
         
-        # Update hand centers
+        # Update hand centers with dynamic clipping
         left_hor_move = action["left_hand_horizontal_movement"] - 87
         new_left_center = self.state["left_center"] + left_hor_move
         self.state["left_center"] = np.clip(new_left_center, min_center_left, max_center_left)
@@ -132,7 +132,7 @@ class PianoEnv(gym.Env):
         new_right_center = self.state["right_center"] + right_hor_move
         self.state["right_center"] = np.clip(new_right_center, min_center_right, max_center_right)
         
-        # Calculate finger positions
+        # Calculate finger positions for left hand
         left_fingers = np.array([
             self.state["left_center"] + left_pinky_offset,
             self.state["left_center"] + self.base_offsets_left['ring'],
@@ -142,6 +142,7 @@ class PianoEnv(gym.Env):
         ], dtype=np.int32)
         self.state["left_hand"] = np.clip(left_fingers, 0, 87)
         
+        # Calculate finger positions for right hand
         right_fingers = np.array([
             self.state["right_center"] + right_thumb_offset,
             self.state["right_center"] + self.base_offsets_right['index'],
@@ -151,7 +152,7 @@ class PianoEnv(gym.Env):
         ], dtype=np.int32)
         self.state["right_hand"] = np.clip(right_fingers, 0, 87)
         
-        # Update active notes
+        # Update active notes with epsilon tolerance
         self.active_notes = [(key, release) for key, release in self.active_notes if release > self.current_step + self.epsilon]
         fingers = action["finger_press"]
         durations = action["finger_duration"]
@@ -172,13 +173,16 @@ class PianoEnv(gym.Env):
         }
         self.performance_sequence.append(note)
         
-        # Reward logic
+        # Compute punishment
+        punishment = 0
         if np.any(self.state["left_hand"] <= 0) or np.any(self.state["left_hand"] >= 87):
-            reward -= 1
+            punishment -= 1
         if np.any(self.state["right_hand"] <= 0) or np.any(self.state["right_hand"] >= 87):
-            reward -= 1
+            punishment -= 1
         if abs(self.state["left_center"] - self.state["right_center"]) < 13:
-            reward -= 1
+            punishment -= 1
+        reward = punishment
+        
         if action["finished_playing"] == 1:
             done = True
             midi_sequence = self.generate_midi_sequence()
@@ -186,8 +190,14 @@ class PianoEnv(gym.Env):
             steps = len(self.performance_sequence)
             step_scale = max(0.0, 1.0 - abs(steps - 300) / 300.0) if abs(steps - 300) >= 1 else 1.0
             reward += critic_score * step_scale
+            info['critic_score'] = critic_score
+            info['step_scale'] = step_scale
+        else:
+            done = False
+            info['critic_score'] = 0
+            info['step_scale'] = 1.0
         
-        return self.state, reward, done, info
+        return self.state, reward, done, info, punishment
     
     def reset(self):
         self.current_step = 0.0
@@ -208,7 +218,7 @@ class PianoEnv(gym.Env):
         
         self.screen.fill((200, 200, 200))
         
-        # Determine pressed keys
+        # Determine pressed keys from active_notes with epsilon tolerance
         pressed_keys = set(key for key, release_step in self.active_notes if release_step > self.current_step + self.epsilon)
         
         # Draw piano keys
@@ -266,7 +276,7 @@ class PianoEnv(gym.Env):
             pygame.draw.rect(self.screen, (80, 80, 180), (palm_left, palm_y - palm_height / 2, palm_right - palm_left, palm_height))
         
         pygame.display.flip()
-        self.clock.tick(1 / self.time_per_step)
+        self.clock.tick(1 / self.time_per_step)  # e.g., 10 FPS for 0.1s/step
     
     def generate_midi_sequence(self):
         midi_sequence = []
@@ -280,6 +290,11 @@ class PianoEnv(gym.Env):
             pygame.quit()
 
 def train_agent(env, agent, num_episodes=1000):
+    """
+    Train the PPO agent with a modified reward calculation.
+    The total reward is normalized between 0 and 1, equal to the critic's reward if no punishments,
+    and reduced based on the magnitude of punishments otherwise.
+    """
     rollouts = {
         'observations': [],
         'actions': {},
@@ -293,12 +308,14 @@ def train_agent(env, agent, num_episodes=1000):
     for episode in range(num_episodes):
         obs = env.reset()
         done = False
-        episode_reward = 0
+        episode_punishment = 0
         episode_steps = []
+        
         while not done:
             obs_vector = np.concatenate([obs['left_hand'], obs['right_hand'], obs['prev_finger']])
             action, log_prob, value = agent.select_action(obs_vector)
             
+            # Initialize or append to rollouts
             if not rollouts['actions']:
                 for key, val in action.items():
                     rollouts['actions'][key] = [val]
@@ -308,26 +325,36 @@ def train_agent(env, agent, num_episodes=1000):
             rollouts['observations'].append(obs_vector)
             rollouts['log_probs'].append(log_prob)
             
-            obs, reward, done, info = env.step(action)
-            episode_reward += reward
+            # Step the environment
+            obs, reward, done, info, punishment = env.step(action)
+            episode_punishment += punishment  # Accumulate punishment (negative)
             episode_steps.append((obs, reward))
             
             if env.render_mode:
                 env.render()
         
+        # Compute normalized total reward when episode ends
+        if done:
+            critic_score = info['critic_score']
+            step_scale = info['step_scale']
+            total_punishment_magnitude = -episode_punishment  # Convert to positive
+            threshold = 300  # Tuning parameter, adjust as needed
+            normalized_reward = critic_score * step_scale * np.exp(-total_punishment_magnitude / threshold)
+            print(f"Episode {episode+1}: Normalized Reward {normalized_reward:.4f}")
+            all_rewards.append(normalized_reward)
+        
+        # Compute returns and advantages for PPO learning
         returns = []
         discounted_sum = 0
-        for (_, reward) in reversed(episode_steps):
+        for _, reward in reversed(episode_steps):
             discounted_sum = reward + gamma * discounted_sum
             returns.insert(0, discounted_sum)
         returns = np.array(returns)
-        advantages = returns.copy()
+        advantages = returns.copy()  # Simplified; typically normalized in PPO
         rollouts['returns'].extend(returns.tolist())
         rollouts['advantages'].extend(advantages.tolist())
         
-        all_rewards.append(episode_reward)
-        print(f"Episode {episode+1}: Reward {episode_reward}")
-        
+        # Update agent and reset rollouts
         loss = agent.update(rollouts)
         rollouts = {
             'observations': [],
@@ -336,6 +363,7 @@ def train_agent(env, agent, num_episodes=1000):
             'returns': [],
             'advantages': []
         }
+    
     return all_rewards
 
 def main():
@@ -366,7 +394,7 @@ def main():
                 
                 action = env.action_space.sample()
                 action["finger_duration"] = np.clip(action["finger_duration"], 0, 1.0)
-                obs, reward, done, info = env.step(action)
+                obs, reward, done, info, _ = env.step(action)  # Ignore punishment
                 total_reward += reward
                 step_count += 1
                 
