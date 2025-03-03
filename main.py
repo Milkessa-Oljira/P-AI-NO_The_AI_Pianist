@@ -2,7 +2,9 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 import pygame
+import pygame.midi
 import argparse
+import time
 
 from models.rl_agent import PPOAgent
 from models.critic_model import evaluate_piano_performance
@@ -10,20 +12,17 @@ from models.critic_model import evaluate_piano_performance
 class PianoEnv(gym.Env):
     metadata = {'render.modes': ['human']}
     
-    # Define base offsets for natural finger spread
-    base_offsets_left = {'pinky': -2, 'ring': -1, 'middle': 0, 'index': 1, 'thumb': 2}
-    base_offsets_right = {'thumb': -2, 'index': -1, 'middle': 0, 'ring': 1, 'pinky': 2}
-    
     def __init__(self, render_mode=False, critic_model_path="critic_model.pth"):
         super(PianoEnv, self).__init__()
         self.render_mode = render_mode
         self.critic_model_path = critic_model_path
         
-        # Timing parameters for dynamic rendering
-        self.time_per_step = 0.1  # Seconds per step (10 FPS base)
-        self.current_step = 0.0   # Track steps as float
-        self.active_notes = []    # List of (key, release_step) tuples
-        self.epsilon = 1e-5       # Small tolerance for floating-point precision
+        # Timing parameters
+        self.time_per_step = 0.1  # Seconds per step
+        self.current_step = 0.0
+        self.active_notes = []  # List of tuples: (key, release_step, velocity)
+        self.active_midi_notes = {}  # Dict: midi_note -> release_step
+        self.epsilon = 1e-5
         
         # Observation space
         self.observation_space = spaces.Dict({
@@ -57,123 +56,186 @@ class PianoEnv(gym.Env):
             "finished_playing": spaces.Discrete(2)
         })
         
-        # Initial state with centers
+        # Initial state: hand centers and positions
         self.state = {
             "left_center": 24,
             "right_center": 60,
-            "left_hand": np.array([24 + self.base_offsets_left[f] for f in ['pinky', 'ring', 'middle', 'index', 'thumb']], dtype=np.int32),
-            "right_hand": np.array([60 + self.base_offsets_right[f] for f in ['thumb', 'index', 'middle', 'ring', 'pinky']], dtype=np.int32),
+            "left_hand": np.array([24 - 2, 24 - 1, 24, 24 + 1, 24 + 2], dtype=np.int32),
+            "right_hand": np.array([60 - 2, 60 - 1, 60, 60 + 1, 60 + 2], dtype=np.int32),
             "prev_finger": np.zeros(10, dtype=np.int32)
         }
         self.performance_sequence = []
+        self.performance_velocities = []
         
-        # Pygame initialization
         if self.render_mode:
+            # Initialize Pygame and its MIDI module
+            pygame.mixer.pre_init(44100, -16, 1, 512)
+            pygame.midi.init()
+            # Initialize MIDI output using the default output device
+            default_id = pygame.midi.get_default_output_id()
+            if default_id == -1:
+                print("No default MIDI output device found. Disabling MIDI playback.")
+                self.midi_out = None
+            else:
+                self.midi_out = pygame.midi.Output(default_id)
             pygame.init()
-            self.screen = pygame.display.set_mode((1200, 400))
+            self.screen = pygame.display.set_mode((1248, 400))
             pygame.display.set_caption('Piano RL Environment')
             self.clock = pygame.time.Clock()
-            self.relative_pos = {0: 0, 1: 0.5, 2: 1, 3: 1.5, 4: 2, 5: 3, 6: 3.5, 7: 4, 8: 4.5, 9: 5, 10: 5.5, 11: 6}
             self.key_rects = self._init_key_rects()
+            self.last_pressed_notes = set()
     
     def _init_key_rects(self):
+        """Initialize key rectangles with realistic proportions and positions."""
+        white_width = 24
+        black_width = 14
+        white_height = 120
+        black_height = 80
+        y_white = 200
+        y_black = 180  # Black keys are slightly raised
         key_rects = []
-        total_units = 7 * 7 + self.relative_pos[87 % 12]
-        scale = 1200 / total_units
-        white_key_width = 24.5  # Adjusted to ensure keys touch
-        black_key_width = 14
-        white_key_height = 120
-        black_key_height = 90
-        base_y = 280
+        white_positions = {}
+        white_count = 0
         
         for n in range(88):
-            note = n % 12
-            octave = n // 12
-            rel_pos = self.relative_pos[note]
-            pos = (octave * 7 + rel_pos) * scale
-            is_white = note in {0, 2, 4, 5, 7, 9, 11}
-            width = white_key_width if is_white else black_key_width
-            height = white_key_height if is_white else black_key_height
-            y = base_y - height if is_white else base_y - height - 30
-            left = pos - width / 2
-            rect = pygame.Rect(left, y, width, height)
-            color = (240, 240, 240) if is_white else (20, 20, 20)
-            key_rects.append((rect, color, is_white))
+            pitch_class = (21 + n) % 12  # MIDI notes 21 (A0) to 108 (C8)
+            if pitch_class in [0, 2, 4, 5, 7, 9, 11]:  # White keys: C, D, E, F, G, A, B
+                x = white_count * white_width
+                white_positions[n] = x
+                rect = pygame.Rect(x, y_white, white_width, white_height)
+                key_rects.append((rect, (240, 240, 240), True))
+                white_count += 1
+            else:  # Black keys: C#, D#, F#, G#, A#
+                left = max([k for k in white_positions if k < n], default=None)
+                right = min([k for k in white_positions if k > n], default=None)
+                if left is not None and right is not None:
+                    x_left = white_positions[left]
+                    x_right = white_positions[right]
+                    x = (x_left + x_right) / 2 - black_width / 2
+                elif left is not None:
+                    x_left = white_positions[left]
+                    x = x_left + white_width / 2 - black_width / 2
+                elif right is not None:
+                    x_right = white_positions[right]
+                    x = x_right - white_width / 2 - black_width / 2
+                else:
+                    x = 0
+                rect = pygame.Rect(x, y_black, black_width, black_height)
+                key_rects.append((rect, (20, 20, 20), False))
         return key_rects
     
+    def map_velocity(self, velocity):
+        """Map continuous velocity (0-127) to a smooth perceived velocity."""
+        low_threshold = 42
+        mid_threshold = 85
+        if velocity < low_threshold:
+            return 21 + (velocity / low_threshold) * (64 - 21)
+        elif velocity < mid_threshold:
+            return 64 + ((velocity - low_threshold) / (mid_threshold - low_threshold)) * (106 - 64)
+        else:
+            return 106 + ((velocity - mid_threshold) / (127 - mid_threshold)) * (127 - 106)
+    
+    def map_duration(self, duration):
+        """Map duration (0-10 sec) to seconds based on 120 BPM (0.5 sec per quarter note)."""
+        quarter_notes = duration * 2  # Scale to 0-20 quarter notes
+        return quarter_notes * 0.5
+    
+    def play_midi_note(self, key, velocity, duration):
+        """
+        Send a MIDI note_on event and schedule a note_off event.
+        :param key: Piano key (0-87); will be converted to a MIDI note by adding 21.
+        :param velocity: MIDI velocity (0-127)
+        :param duration: Duration in seconds
+        """
+        midi_note = key + 21
+        if self.midi_out is not None:
+            self.midi_out.note_on(midi_note, int(velocity))
+            off_time = self.current_step + (duration / self.time_per_step)
+            self.active_midi_notes[midi_note] = off_time
+        else:
+            # Fallback: Use synthesized sound if no MIDI device available
+            self.fallback_play_note(key, velocity, duration)   
+
+    def fallback_play_note(self, key, velocity, duration):
+        import numpy as np
+        sample_rate = 44100
+        midi_note = key + 21
+        frequency = 440 * (2 ** ((midi_note - 69) / 12))
+        t = np.linspace(0, duration, int(sample_rate * duration), False)
+        # Basic FM synthesis with ADSR envelope as a fallback
+        attack_time = 0.05 * duration
+        decay_time = 0.1 * duration
+        sustain_level = 0.7
+        release_time = 0.2 * duration
+        envelope = np.ones_like(t)
+        attack_samples = int(attack_time * sample_rate)
+        decay_samples = int(decay_time * sample_rate)
+        release_samples = int(release_time * sample_rate)
+        sustain_samples = len(t) - attack_samples - decay_samples - release_samples
+        if attack_samples > 0:
+            envelope[:attack_samples] = np.linspace(0, 1, attack_samples)
+        if decay_samples > 0:
+            envelope[attack_samples:attack_samples+decay_samples] = np.linspace(1, sustain_level, decay_samples)
+        if release_samples > 0:
+            envelope[-release_samples:] = np.linspace(sustain_level, 0, release_samples)
+        mod_index = 2.0
+        mod_ratio = 2.0
+        modulator = np.sin(2 * np.pi * frequency * mod_ratio * t)
+        carrier = np.sin(2 * np.pi * frequency * t + mod_index * modulator)
+        amplitude = velocity / 127.0
+        waveform = carrier * envelope * amplitude
+        waveform_int16 = np.int16(waveform * 32767)
+        sound = pygame.sndarray.make_sound(waveform_int16)
+        sound.play()    
+
     def step(self, action):
         self.current_step += 1.0
         reward = 0
         done = False
         info = {}
         
-        # Extract stretch actions for left hand
-        left_pinky_stretch = action["left_hand_finger_stretch"]["pinky"].item()  # 0 or 1
-        left_thumb_stretch = action["left_hand_finger_stretch"]["thumb"].item()  # 0, 1, or 2
-        left_pinky_offset = -3 if left_pinky_stretch == 0 else -2
-        left_thumb_offset = 2 + left_thumb_stretch
-        min_center_left = -left_pinky_offset  # e.g., 3 or 2
-        max_center_left = 87 - left_thumb_offset  # e.g., 85, 84, or 83
-        
-        # Extract stretch actions for right hand
-        right_thumb_stretch = action["right_hand_finger_stretch"]["thumb"].item()  # 0, 1, or 2
-        right_pinky_stretch = action["right_hand_finger_stretch"]["pinky"].item()  # 0 or 1
-        right_thumb_offset = -2 - right_thumb_stretch  # -2, -3, or -4
-        right_pinky_offset = 2 + (1 if right_pinky_stretch == 1 else 0)  # 2 or 3
-        min_center_right = -right_thumb_offset  # e.g., 2, 3, or 4
-        max_center_right = 87 - right_pinky_offset  # e.g., 85 or 84
-        
-        # Update hand centers with dynamic clipping
+        # Update hand centers from horizontal movement actions
         left_hor_move = action["left_hand_horizontal_movement"] - 87
-        new_left_center = self.state["left_center"] + left_hor_move
-        self.state["left_center"] = np.clip(new_left_center, min_center_left, max_center_left)
-        
+        self.state["left_center"] = np.clip(self.state["left_center"] + left_hor_move, 0, 87)
         right_hor_move = action["right_hand_horizontal_movement"] - 87
-        new_right_center = self.state["right_center"] + right_hor_move
-        self.state["right_center"] = np.clip(new_right_center, min_center_right, max_center_right)
+        self.state["right_center"] = np.clip(self.state["right_center"] + right_hor_move, 0, 87)
         
-        # Calculate finger positions for left hand
-        left_fingers = np.array([
-            self.state["left_center"] + left_pinky_offset,
-            self.state["left_center"] + self.base_offsets_left['ring'],
-            self.state["left_center"] + self.base_offsets_left['middle'],
-            self.state["left_center"] + self.base_offsets_left['index'],
-            self.state["left_center"] + left_thumb_offset
-        ], dtype=np.int32)
-        self.state["left_hand"] = np.clip(left_fingers, 0, 87)
+        # Update finger positions (simplified model)
+        self.state["left_hand"] = np.clip(self.state["left_center"] + np.array([-2, -1, 0, 1, 2]), 0, 87)
+        self.state["right_hand"] = np.clip(self.state["right_center"] + np.array([-2, -1, 0, 1, 2]), 0, 87)
         
-        # Calculate finger positions for right hand
-        right_fingers = np.array([
-            self.state["right_center"] + right_thumb_offset,
-            self.state["right_center"] + self.base_offsets_right['index'],
-            self.state["right_center"] + self.base_offsets_right['middle'],
-            self.state["right_center"] + self.base_offsets_right['ring'],
-            self.state["right_center"] + right_pinky_offset
-        ], dtype=np.int32)
-        self.state["right_hand"] = np.clip(right_fingers, 0, 87)
+        # Update active notes: remove expired ones
+        self.active_notes = [(key, release, vel) for key, release, vel in self.active_notes if release > self.current_step + self.epsilon]
+        # Process scheduled MIDI note offs
+        if self.midi_out is not None:
+            for midi_note, off_time in list(self.active_midi_notes.items()):
+                if off_time <= self.current_step:
+                    self.midi_out.note_off(midi_note, 0)
+                    del self.active_midi_notes[midi_note]
         
-        # Update active notes with epsilon tolerance
-        self.active_notes = [(key, release) for key, release in self.active_notes if release > self.current_step + self.epsilon]
         fingers = action["finger_press"]
         durations = action["finger_duration"]
+        velocities = action["finger_velocity"]
         for i in range(10):
             if fingers[i] == 1:
                 key = self.state["left_hand"][i] if i < 5 else self.state["right_hand"][i - 5]
-                duration_steps = durations[i] / self.time_per_step
-                release_step = self.current_step + duration_steps
-                self.active_notes.append((key, release_step))
+                mapped_duration = self.map_duration(durations[i])
+                release_step = self.current_step + mapped_duration / self.time_per_step
+                mapped_velocity = self.map_velocity(velocities[i])
+                self.active_notes.append((key, release_step, mapped_velocity))
+                if self.render_mode:
+                    self.play_midi_note(key, mapped_velocity, mapped_duration)
         
         self.state["prev_finger"] = np.array(fingers, dtype=np.int32)
-        
-        # Record performance
         note = {
             "left": self.state["left_hand"].tolist(),
             "right": self.state["right_hand"].tolist(),
             "press": self.state["prev_finger"].tolist()
         }
         self.performance_sequence.append(note)
+        self.performance_velocities.append([self.map_velocity(v) for v in velocities])
         
-        # Compute punishment
+        # Compute punishment (simplified)
         punishment = 0
         if np.any(self.state["left_hand"] <= 0) or np.any(self.state["left_hand"] >= 87):
             punishment -= 1
@@ -202,99 +264,76 @@ class PianoEnv(gym.Env):
     def reset(self):
         self.current_step = 0.0
         self.active_notes = []
+        self.active_midi_notes = {}
         self.state = {
             "left_center": 24,
             "right_center": 60,
-            "left_hand": np.array([24 + self.base_offsets_left[f] for f in ['pinky', 'ring', 'middle', 'index', 'thumb']], dtype=np.int32),
-            "right_hand": np.array([60 + self.base_offsets_right[f] for f in ['thumb', 'index', 'middle', 'ring', 'pinky']], dtype=np.int32),
+            "left_hand": np.array([24 - 2, 24 - 1, 24, 24 + 1, 24 + 2], dtype=np.int32),
+            "right_hand": np.array([60 - 2, 60 - 1, 60, 60 + 1, 60 + 2], dtype=np.int32),
             "prev_finger": np.zeros(10, dtype=np.int32)
         }
         self.performance_sequence = []
+        self.performance_velocities = []
         return self.state
     
     def render(self, mode='human'):
+        """Render a 3D-looking, highly animated realistic piano with MIDI-based sound."""
         if not self.render_mode:
             return
         
-        self.screen.fill((200, 200, 200))
+        self.screen.fill((220, 220, 220))
         
-        # Determine pressed keys from active_notes with epsilon tolerance
-        pressed_keys = set(key for key, release_step in self.active_notes if release_step > self.current_step + self.epsilon)
-        
-        # Draw piano keys
+        # Determine pressed keys from the current state (immediate finger press)
+        pressed_keys = set()
+        for i, pressed in enumerate(self.state["prev_finger"]):
+            if pressed == 1:
+                if i < 5:
+                    key = self.state["left_hand"][i]
+                else:
+                    key = self.state["right_hand"][i - 5]
+                pressed_keys.add(key)
+
+        # Draw keys with shading and press effects based on pressed_keys
         for n, (rect, base_color, is_white) in enumerate(self.key_rects):
+            draw_rect = rect.copy()
             if n in pressed_keys:
-                color = (180, 180, 180) if is_white else (60, 60, 60)
-                rect.y += 5
+                draw_rect.y += 5  # Simulate key depression
+                color = (0, 0, 200)
             else:
                 color = base_color
-            pygame.draw.rect(self.screen, color, rect)
+            pygame.draw.rect(self.screen, color, draw_rect)
             if is_white:
-                pygame.draw.line(self.screen, (150, 150, 150), (rect.left, rect.top), (rect.left, rect.bottom), 2)
-                pygame.draw.line(self.screen, (150, 150, 150), (rect.left, rect.bottom), (rect.right, rect.bottom), 2)
-                pygame.draw.line(self.screen, (255, 255, 255), (rect.left, rect.top), (rect.right, rect.top), 1)
+                pygame.draw.line(self.screen, (255, 255, 255), (draw_rect.left, draw_rect.top), (draw_rect.right, draw_rect.top), 1)
+                pygame.draw.line(self.screen, (180, 180, 180), (draw_rect.left, draw_rect.bottom - 1), (draw_rect.right, draw_rect.bottom - 1), 1)
             else:
-                pygame.draw.line(self.screen, (50, 50, 50), (rect.left, rect.top), (rect.right, rect.top), 2)
-            if n in pressed_keys:
-                rect.y -= 5
+                pygame.draw.line(self.screen, (50, 50, 50), (draw_rect.left, draw_rect.top), (draw_rect.right, draw_rect.top), 1)
+                pygame.draw.line(self.screen, (0, 0, 0), (draw_rect.left, draw_rect.bottom - 1), (draw_rect.right, draw_rect.bottom - 1), 1)
         
-        # Hand rendering
-        palm_y = 300
-        finger_length = 20
-        pressing_y = 280
-        
-        # Left hand
-        left_finger_xs = [self.key_rects[key][0].centerx for key in self.state["left_hand"]]
-        for i, x in enumerate(left_finger_xs):
-            is_pressing = self.state["left_hand"][i] in pressed_keys
-            y_end = pressing_y if is_pressing else palm_y - finger_length
-            color = (255, 100, 100) if is_pressing else (200, 80, 80)
-            width = 7 if is_pressing else 5
-            pygame.draw.line(self.screen, color, (x, palm_y), (x, y_end), width)
-        
-        # Left palm
-        if left_finger_xs:
-            palm_left = min(left_finger_xs) - 10
-            palm_right = max(left_finger_xs) + 10
-            palm_height = 20
-            pygame.draw.rect(self.screen, (180, 80, 80), (palm_left, palm_y - palm_height / 2, palm_right - palm_left, palm_height))
-        
-        # Right hand
-        right_finger_xs = [self.key_rects[key][0].centerx for key in self.state["right_hand"]]
-        for i, x in enumerate(right_finger_xs):
-            is_pressing = self.state["right_hand"][i] in pressed_keys
-            y_end = pressing_y if is_pressing else palm_y - finger_length
-            color = (100, 100, 255) if is_pressing else (80, 80, 200)
-            width = 7 if is_pressing else 5
-            pygame.draw.line(self.screen, color, (x, palm_y), (x, y_end), width)
-        
-        # Right palm
-        if right_finger_xs:
-            palm_left = min(right_finger_xs) - 10
-            palm_right = max(right_finger_xs) + 10
-            palm_height = 20
-            pygame.draw.rect(self.screen, (80, 80, 180), (palm_left, palm_y - palm_height / 2, palm_right - palm_left, palm_height))
+        # Draw piano body (frame)
+        pygame.draw.rect(self.screen, (80, 40, 0), (0, 280, 1248, 120))
         
         pygame.display.flip()
-        self.clock.tick(1 / self.time_per_step)  # e.g., 10 FPS for 0.1s/step
+        # self.clock.tick(60)
     
     def generate_midi_sequence(self):
-        midi_sequence = []
-        for note in self.performance_sequence:
-            midi_sequence.extend(note["left"])
-            midi_sequence.extend(note["right"])
+        note_events = []
+        for t, note in enumerate(self.performance_sequence):
+            for i in range(10):
+                if note["press"][i] == 1:
+                    key = note["left"][i] if i < 5 else note["right"][i - 5]
+                    velocity = self.performance_velocities[t][i]
+                    note_events.append((key + 21, velocity))
+        midi_sequence = [pitch for pitch, _ in note_events]
         return midi_sequence
     
     def close(self):
         if self.render_mode:
+            if self.midi_out is not None:
+                self.midi_out.close()
+            pygame.midi.quit()
             pygame.quit()
 
 def train_agent(env, agent, num_episodes=1000):
-    """
-    Train the PPO agent with a modified reward calculation.
-    The total reward is normalized between 0 and 1, equal to the critic's reward if no punishments,
-    and reduced based on the magnitude of punishments otherwise.
-    """
     rollouts = {
         'observations': [],
         'actions': {},
@@ -315,7 +354,6 @@ def train_agent(env, agent, num_episodes=1000):
             obs_vector = np.concatenate([obs['left_hand'], obs['right_hand'], obs['prev_finger']])
             action, log_prob, value = agent.select_action(obs_vector)
             
-            # Initialize or append to rollouts
             if not rollouts['actions']:
                 for key, val in action.items():
                     rollouts['actions'][key] = [val]
@@ -325,36 +363,32 @@ def train_agent(env, agent, num_episodes=1000):
             rollouts['observations'].append(obs_vector)
             rollouts['log_probs'].append(log_prob)
             
-            # Step the environment
             obs, reward, done, info, punishment = env.step(action)
-            episode_punishment += punishment  # Accumulate punishment (negative)
+            episode_punishment += punishment
             episode_steps.append((obs, reward))
             
             if env.render_mode:
                 env.render()
         
-        # Compute normalized total reward when episode ends
         if done:
             critic_score = info['critic_score']
             step_scale = info['step_scale']
-            total_punishment_magnitude = -episode_punishment  # Convert to positive
-            threshold = 300  # Tuning parameter, adjust as needed
+            total_punishment_magnitude = -episode_punishment
+            threshold = 300
             normalized_reward = critic_score * step_scale * np.exp(-total_punishment_magnitude / threshold)
             print(f"Episode {episode+1}: Normalized Reward {normalized_reward:.4f}")
             all_rewards.append(normalized_reward)
         
-        # Compute returns and advantages for PPO learning
         returns = []
         discounted_sum = 0
         for _, reward in reversed(episode_steps):
             discounted_sum = reward + gamma * discounted_sum
             returns.insert(0, discounted_sum)
         returns = np.array(returns)
-        advantages = returns.copy()  # Simplified; typically normalized in PPO
+        advantages = returns.copy()
         rollouts['returns'].extend(returns.tolist())
         rollouts['advantages'].extend(advantages.tolist())
         
-        # Update agent and reset rollouts
         loss = agent.update(rollouts)
         rollouts = {
             'observations': [],
@@ -391,22 +425,17 @@ def main():
                         if event.type == pygame.QUIT:
                             running = False
                             break
-                
                 action = env.action_space.sample()
-                action["finger_duration"] = np.clip(action["finger_duration"], 0, 1.0)
-                obs, reward, done, info, _ = env.step(action)  # Ignore punishment
+                action["finger_duration"] = np.clip(action["finger_duration"], 0, 10.0)
+                obs, reward, done, info, _ = env.step(action)
                 total_reward += reward
                 step_count += 1
-                
                 if args.render:
                     env.render()
-                
                 if step_count % 100 == 0:
                     print(f"Step {step_count}: Total Reward = {total_reward}")
-        
         except KeyboardInterrupt:
             print(f"Visualization stopped manually. Total Steps = {step_count}, Total Reward = {total_reward}")
-        
         if not running:
             print(f"Visualization stopped (window closed). Total Steps = {step_count}, Total Reward = {total_reward}")
     

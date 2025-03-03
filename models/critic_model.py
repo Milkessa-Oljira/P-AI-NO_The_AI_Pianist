@@ -120,24 +120,46 @@ def evaluate_piano_performance(midi_sequence, model_path, device='cpu'):
     Returns:
         float: A score between 0 and 1 indicating performance quality.
     """
+    # Validate input
+    if len(midi_sequence) == 0:
+        print("Warning: Empty MIDI sequence provided for evaluation")
+        return 0.0
+    
     model = CriticModel().to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
+    
     with torch.no_grad():
         if not isinstance(midi_sequence, torch.Tensor):
             midi_tensor = torch.tensor(midi_sequence, dtype=torch.long, device=device).unsqueeze(0)
         else:
             midi_tensor = midi_sequence.unsqueeze(0).to(device)
+        
+        # Handle empty sequences
+        if midi_tensor.numel() == 0:
+            print("Warning: Empty MIDI tensor after conversion")
+            return 0.0
+            
         score = model(midi_tensor).item()
+    
     return score
 
+
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset_root', type=str, nargs='?', default='datasets/', help='Path to the MAESTRO dataset folder')
-    parser.add_argument('--save_path', type=str, default='model_chkpts/critic_model.pth', help='Path to save the trained critic model')
-    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
-    parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--device', type=str, default='cpu', help='Device to use: cpu or cuda')
-    args = parser.parse_args()
-    train_critic(args.dataset_root, args.save_path, args.epochs, args.batch_size, args.lr, args.device)
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument('--dataset_root', type=str, nargs='?', default='datasets/', help='Path to the MAESTRO dataset folder')
+    # parser.add_argument('--save_path', type=str, default='model_chkpts/critic_model.pth', help='Path to save the trained critic model')
+    # parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs')
+    # parser.add_argument('--batch_size', type=int, default=1, help='Batch size for training')
+    # parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
+    # parser.add_argument('--device', type=str, default='cpu', help='Device to use: cpu or cuda')
+    # args = parser.parse_args()
+    # train_critic(args.dataset_root, args.save_path, args.epochs, args.batch_size, args.lr, args.device)
+
+    mf = midi.MidiFile()
+    mf.open('datasets/MIDI-Unprocessed_01_R1_2006_01-09_ORIG_MID--AUDIO_01_R1_2006_01_Track01_wav.midi')
+    mf.read()
+    mf.close()
+    for track in mf.tracks:
+        print(track.events)
+

@@ -249,13 +249,17 @@ class PPOAgent:
         obs_tensor = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
         with torch.no_grad():
             action, log_prob, value = self.policy.sample_action(obs_tensor)
-            # Remove batch dimension from action components
             action = {k: v[0] if isinstance(v, torch.Tensor) and v.dim() > 0 else v for k, v in action.items()}
-            # Extract scalar values for log_prob and value
             log_prob = log_prob.item() if log_prob.dim() > 0 else log_prob
             value = value.item() if value.dim() > 0 else value
-        # Convert tensors to NumPy arrays
-        action_np = {k: (v.cpu().numpy() if isinstance(v, torch.Tensor) else v) for k, v in action.items()}
+            action_np = {k: (v.cpu().numpy() if isinstance(v, torch.Tensor) else v) for k, v in action.items()}
+            # Clip actions to match environment expectations
+            if "finger_velocity" in action_np:
+                action_np["finger_velocity"] = np.clip(action_np["finger_velocity"], 0, 127)
+            if "finger_duration" in action_np:
+                action_np["finger_duration"] = np.clip(action_np["finger_duration"], 0, 10)
+            if "pedal_actions" in action_np:
+                action_np["pedal_actions"] = np.clip(action_np["pedal_actions"], 0, 1)
         return action_np, log_prob, value
 
     def update(self, rollouts):
@@ -301,6 +305,7 @@ class PPOAgent:
 
     def load(self, path):
         self.policy.load_state_dict(torch.load(path, map_location=self.device))
+
 
 if __name__ == '__main__':
     # Example usage
