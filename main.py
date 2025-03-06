@@ -313,7 +313,7 @@ class PianoEnv(gym.Env):
         pygame.draw.rect(self.screen, (80, 40, 0), (0, 280, 1248, 120))
         
         pygame.display.flip()
-        # self.clock.tick(60)
+        self.clock.tick(60)
     
     def generate_midi_sequence(self):
         note_events = []
